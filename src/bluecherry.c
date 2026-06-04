@@ -797,6 +797,46 @@ cleanup:
 
 #pragma endregion
 #pragma region CoAP RXTX
+/**
+ * @brief Parse the ACK message ID from a received CoAP packet.
+ *
+ * @param buf Pointer to the input packet buffer.
+ * @param len Number of bytes in the packet buffer.
+ * @param type Output pointer for the packet type.
+ * @param msg_id Output pointer for the parsed message ID.
+ *
+ * @return ESP_OK if parsing succeeded.
+ */
+static esp_err_t _bluecherry_parse_ack_meta(const uint8_t* buf, size_t len, uint8_t* type,
+                                            uint16_t* msg_id)
+{
+  if(len < 4) {
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  size_t offset = 0;
+  uint8_t header = buf[offset++];
+  uint8_t version = (header >> 6) & 0x03;
+  if(version != 1) {
+    return ESP_ERR_INVALID_VERSION;
+  }
+
+  *type = (header >> 4) & 0x03;
+  uint8_t token_len = header & 0x0F;
+
+  if(len < (size_t) (4 + token_len)) {
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  offset += token_len;
+  offset++; // code
+
+  *msg_id = buf[offset++];
+  *msg_id <<= 8;
+  *msg_id |= buf[offset++];
+
+  return ESP_OK;
+}
 
 /**
  * @brief Perform CoAP transmit and receive operations with the BlueCherry cloud.
@@ -821,21 +861,17 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
     return ESP_ERR_NO_MEM;
   }
 
-  _bluecherry_opdata.cur_message_id += 1;
-  if(_bluecherry_opdata.cur_message_id == 0) {
-    _bluecherry_opdata.cur_message_id = 1;
+  uint16_t tx_message_id = _bluecherry_opdata.cur_message_id + 1;
+  if(tx_message_id == 0) {
+    tx_message_id = 1;
   }
 
-  int32_t last_acked_message_id = _bluecherry_opdata.last_acked_message_id;
-  if(last_acked_message_id > _bluecherry_opdata.cur_message_id) {
-    last_acked_message_id -= 0xffff;
-  }
-  uint8_t missed_msg_count = _bluecherry_opdata.cur_message_id - last_acked_message_id - 1;
+  uint8_t missed_msg_count = (uint8_t) (tx_message_id - _bluecherry_opdata.last_acked_message_id - 1);
 
   data[0] = 0x40;
   data[1] = missed_msg_count;
-  data[2] = _bluecherry_opdata.cur_message_id >> 8;
-  data[3] = _bluecherry_opdata.cur_message_id & 0xFF;
+  data[2] = tx_message_id >> 8;
+  data[3] = tx_message_id & 0xFF;
   data[4] = 0xFF;
 
   double timeout = BLUECHERRY_ACK_TIMEOUT *
@@ -855,6 +891,33 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
       int ret = _bluecherry_mbed_dtls_read(_bluecherry_opdata.in_buf, BLUECHERRY_MAX_MESSAGE_LEN);
       if(ret > 0) {
         _bluecherry_opdata.in_buf_len = ret;
+
+        uint8_t rsp_type = 0;
+        uint16_t rsp_message_id = 0;
+        esp_err_t perr = _bluecherry_parse_ack_meta(_bluecherry_opdata.in_buf,
+                                                     _bluecherry_opdata.in_buf_len, &rsp_type,
+                                                     &rsp_message_id);
+        if(perr == ESP_ERR_INVALID_VERSION) {
+          ESP_LOGW(TAG, "Ignoring CoAP packet with invalid version while awaiting ACK");
+          continue;
+        }
+        if(perr != ESP_OK) {
+          ESP_LOGW(TAG, "Ignoring malformed CoAP packet while awaiting ACK");
+          continue;
+        }
+
+        if(rsp_type != BLUECHERRY_COAP_TYPE_ACK) {
+          ESP_LOGW(TAG, "Ignoring non-ACK CoAP packet while awaiting ACK");
+          continue;
+        }
+
+        if (rsp_message_id != tx_message_id) {
+          ESP_LOGW(TAG, "Received ACK with mismatching message ID %" PRIu16 " while awaiting %" PRIu16,
+                   rsp_message_id, tx_message_id);
+          continue;
+        }
+
+        _bluecherry_opdata.cur_message_id = tx_message_id;
         _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_RECEIVED_ACK;
         return ESP_OK;
       } else if(ret != MBEDTLS_ERR_SSL_TIMEOUT) {
@@ -1738,6 +1801,10 @@ esp_err_t bluecherry_sync(bool blocking)
         retryIntervalMs = (retryIntervalMs < 30000) ? retryIntervalMs * 2 : 30000;
         return ESP_ERR_NOT_FINISHED;
       }
+
+      _bluecherry_opdata.cur_message_id = 0;
+      _bluecherry_opdata.last_acked_message_id = 0;
+
       _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_IDLE;
       retryIntervalMs = 100;
     } else {
@@ -1767,7 +1834,6 @@ esp_err_t bluecherry_sync(bool blocking)
         ESP_LOGD(TAG, "Could not remove transmitted message from queue");
         return ESP_FAIL;
       }
-      ESP_LOGD(TAG, "Synchronized messages with cloud");
     } else {
       ESP_LOGE(TAG, "Could not sync payload with cloud");
       _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
@@ -1782,7 +1848,6 @@ esp_err_t bluecherry_sync(bool blocking)
         _bluecherry_opdata.state = BLUECHERRY_STATE_AWAIT_CONNECTION;
         return ESP_ERR_NOT_FINISHED;
       }
-      ESP_LOGD(TAG, "Synchronized messages with cloud");
     } else {
       // No messages to send and no periodic sync needed
       return ESP_OK;
@@ -1790,6 +1855,11 @@ esp_err_t bluecherry_sync(bool blocking)
   }
 
   bool want_resync = false;
+
+  if(_bluecherry_opdata.in_buf_len < BLUECHERRY_COAP_HEADER_SIZE) {
+    ESP_LOGE(TAG, "Received CoAP packet too small: %u", (unsigned) _bluecherry_opdata.in_buf_len);
+    return ESP_ERR_INVALID_SIZE;
+  }
 
   uint16_t offset = 0;
 
@@ -1802,12 +1872,23 @@ esp_err_t bluecherry_sync(bool blocking)
 
   uint8_t type = (header >> 4) & 0x03;
   uint8_t token_len = header & 0x0F;
+
+  size_t min_header_len = (size_t) (1 + token_len + 1 + 2 + 1);
+  if(_bluecherry_opdata.in_buf_len < min_header_len) {
+    ESP_LOGE(TAG, "Received CoAP packet with invalid length %u for token length %u",
+             (unsigned) _bluecherry_opdata.in_buf_len, token_len);
+    return ESP_ERR_INVALID_SIZE;
+  }
+
   offset += token_len;
   uint8_t code = _bluecherry_opdata.in_buf[offset++];
   uint16_t msg_id = _bluecherry_opdata.in_buf[offset++];
   msg_id <<= 8;
   msg_id |= _bluecherry_opdata.in_buf[offset++];
-  offset++;
+  if(_bluecherry_opdata.in_buf[offset++] != 0xFF) {
+    ESP_LOGE(TAG, "Received CoAP packet without payload marker");
+    return ESP_ERR_INVALID_RESPONSE;
+  }
 
   if(type == BLUECHERRY_COAP_TYPE_ACK) {
     if(msg_id != _bluecherry_opdata.cur_message_id) {
@@ -1837,6 +1918,11 @@ esp_err_t bluecherry_sync(bool blocking)
     uint8_t topic = _bluecherry_opdata.in_buf[offset++];
     uint8_t data_len = _bluecherry_opdata.in_buf[offset++];
 
+    if(offset + data_len > _bluecherry_opdata.in_buf_len) {
+      ESP_LOGE(TAG, "Received malformed payload length");
+      return ESP_ERR_INVALID_SIZE;
+    }
+
     if(topic == 0x00) {
       want_resync = true;
 
@@ -1853,10 +1939,12 @@ esp_err_t bluecherry_sync(bool blocking)
   }
 
   if(want_resync) {
+    ESP_LOGD(TAG, "Synchronized messages with cloud");
     _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_PENDING_MESSAGES;
     return BLUECHERRY_SYNC_CONTINUE;
   }
 
+  ESP_LOGD(TAG, "Synchronized messages with cloud");
   _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_IDLE;
   return ESP_OK;
 }
