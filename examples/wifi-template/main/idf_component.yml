@@ -1,5 +1,9 @@
 dependencies:
   idf:
     version: ">=4.1.0"
-  bluecherry/bluecherry:
-    version: ">=1.3.4"
+
+  # bluecherry/bluecherry:
+  #   version: ">=1.3.4"
+
+  bluecherry-esp-idf:
+    path: ../../../

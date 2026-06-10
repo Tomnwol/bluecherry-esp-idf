@@ -28,12 +28,12 @@
 /**
  * @brief Fill in the SSID of the WiFi network you want to connect to.
  */
-#define WIFI_SSID ""
+#define WIFI_SSID "DPTechnics"
 
 /**
  * @brief Fill in the password of the WiFi network you want to connect to.
  */
-#define WIFI_PASSWORD ""
+#define WIFI_PASSWORD "makkelijk"
 
 /**
  * @brief Choose the WiFi authentication method that your network uses.
