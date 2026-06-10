@@ -220,7 +220,7 @@ static const UBaseType_t BLUECHERRY_SP = 10;
 /**
  * @brief The size of the BlueCherry CoAP header.
  */
-static const size_t BLUECHERRY_COAP_HEADER_SIZE = 5;
+static const size_t BLUECHERRY_COAP_HEADER_SIZE = 4;
 
 /**
  * @brief The size the the BlueCherry MQTT header.

@@ -40,7 +40,7 @@ static const char* BLUECHERRY_HOST = "coap.bluecherry.io";
 /**
  * @brief The port of the BlueCherry cloud.
  */
-static const char* BLUECHERRY_PORT = "5684";
+static const char* BLUECHERRY_PORT = "5680";
 
 /**
  * @brief The port of the BlueCherry ZTP server.
@@ -857,22 +857,24 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
   size_t data_len = msg == NULL ? BLUECHERRY_COAP_HEADER_SIZE : msg->len;
 
   if(data_len < BLUECHERRY_COAP_HEADER_SIZE) {
-    ESP_LOGE(TAG, "Cannot send CoAP message smaller than %dB", BLUECHERRY_COAP_HEADER_SIZE);
-    return ESP_ERR_NO_MEM;
+      ESP_LOGE(TAG, "Cannot send CoAP message smaller than %dB", BLUECHERRY_COAP_HEADER_SIZE);
+      return ESP_ERR_NO_MEM;
   }
 
   uint16_t tx_message_id = _bluecherry_opdata.cur_message_id + 1;
   if(tx_message_id == 0) {
-    tx_message_id = 1;
+      tx_message_id = 1;
   }
 
   uint8_t missed_msg_count = (uint8_t) (tx_message_id - _bluecherry_opdata.last_acked_message_id - 1);
-
   data[0] = 0x40;
   data[1] = missed_msg_count;
   data[2] = tx_message_id >> 8;
   data[3] = tx_message_id & 0xFF;
-  data[4] = 0xFF;
+  if(msg != NULL && msg->len > BLUECHERRY_COAP_HEADER_SIZE) {
+  } else {
+      data_len = BLUECHERRY_COAP_HEADER_SIZE;
+  }
 
   double timeout = BLUECHERRY_ACK_TIMEOUT *
                    (1 + (rand() / (RAND_MAX + 1.0)) * (BLUECHERRY_ACK_RANDOM_FACTOR - 1));
@@ -1802,8 +1804,8 @@ esp_err_t bluecherry_sync(bool blocking)
         return ESP_ERR_NOT_FINISHED;
       }
 
-      _bluecherry_opdata.cur_message_id = 0;
-      _bluecherry_opdata.last_acked_message_id = 0;
+      _bluecherry_opdata.cur_message_id = 25;
+      _bluecherry_opdata.last_acked_message_id = 25;
 
       _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_IDLE;
       retryIntervalMs = 100;
@@ -1873,7 +1875,7 @@ esp_err_t bluecherry_sync(bool blocking)
   uint8_t type = (header >> 4) & 0x03;
   uint8_t token_len = header & 0x0F;
 
-  size_t min_header_len = (size_t) (1 + token_len + 1 + 2 + 1);
+  size_t min_header_len = (size_t) (token_len + BLUECHERRY_COAP_HEADER_SIZE);
   if(_bluecherry_opdata.in_buf_len < min_header_len) {
     ESP_LOGE(TAG, "Received CoAP packet with invalid length %u for token length %u",
              (unsigned) _bluecherry_opdata.in_buf_len, token_len);
@@ -1885,9 +1887,12 @@ esp_err_t bluecherry_sync(bool blocking)
   uint16_t msg_id = _bluecherry_opdata.in_buf[offset++];
   msg_id <<= 8;
   msg_id |= _bluecherry_opdata.in_buf[offset++];
-  if(_bluecherry_opdata.in_buf[offset++] != 0xFF) {
-    ESP_LOGE(TAG, "Received CoAP packet without payload marker");
-    return ESP_ERR_INVALID_RESPONSE;
+  bool has_payload = (offset < _bluecherry_opdata.in_buf_len);
+  if(has_payload) {
+      if(_bluecherry_opdata.in_buf[offset++] != 0xFF) {
+          ESP_LOGE(TAG, "Received CoAP packet without payload marker");
+          return ESP_ERR_INVALID_RESPONSE;
+      }
   }
 
   if(type == BLUECHERRY_COAP_TYPE_ACK) {
@@ -1952,31 +1957,29 @@ esp_err_t bluecherry_sync(bool blocking)
 esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data)
 {
   ESP_LOGD(TAG, "Scheduling publish on topic 0x%02X with %dB of data", topic, len);
-  if(len >
-     (BLUECHERRY_MAX_MESSAGE_LEN - (BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE))) {
-    ESP_LOGE(TAG, "The message exceeds the maximum allowed size");
-    return ESP_ERR_INVALID_SIZE;
+
+  if(len > (BLUECHERRY_MAX_MESSAGE_LEN - (BLUECHERRY_COAP_HEADER_SIZE + 1 + BLUECHERRY_MQTT_HEADER_SIZE))) {
+      ESP_LOGE(TAG, "The message exceeds the maximum allowed size");
+      return ESP_ERR_INVALID_SIZE;
   }
 
-  size_t total_len = BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE + len;
-
+  size_t total_len = BLUECHERRY_COAP_HEADER_SIZE + 1 + BLUECHERRY_MQTT_HEADER_SIZE + len;
   uint8_t* data_cpy = malloc(total_len);
   if(data_cpy == NULL) {
-    ESP_LOGE(TAG, "Could not allocate publish buffer: %s", strerror(errno));
-    return ESP_ERR_NO_MEM;
+      ESP_LOGE(TAG, "Could not allocate publish buffer: %s", strerror(errno));
+      return ESP_ERR_NO_MEM;
   }
 
-  (data_cpy + BLUECHERRY_COAP_HEADER_SIZE)[0] = topic;
-  (data_cpy + BLUECHERRY_COAP_HEADER_SIZE)[1] = len & 0xFF;
-  memcpy(data_cpy + BLUECHERRY_COAP_HEADER_SIZE + BLUECHERRY_MQTT_HEADER_SIZE, data, len);
+  data_cpy[BLUECHERRY_COAP_HEADER_SIZE] = 0xFF;
+  data_cpy[BLUECHERRY_COAP_HEADER_SIZE + 1] = topic;
+  data_cpy[BLUECHERRY_COAP_HEADER_SIZE + 2] = len & 0xFF;
+  memcpy(data_cpy + BLUECHERRY_COAP_HEADER_SIZE + 3, data, len);
 
   _bluecherry_msg_t msg = { .len = total_len, .data = data_cpy };
-
   if(xQueueSendToBack(_bluecherry_opdata.out_queue, &msg, 0) != pdTRUE) {
-    free(data_cpy);
-    return ESP_ERR_NO_MEM;
+      free(data_cpy);
+      return ESP_ERR_NO_MEM;
   }
-
   return ESP_OK;
 }
 
