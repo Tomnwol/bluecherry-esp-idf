@@ -807,33 +807,50 @@ cleanup:
  *
  * @return ESP_OK if parsing succeeded.
  */
-static esp_err_t _bluecherry_parse_ack_meta(const uint8_t* buf, size_t len, uint8_t* type,
-                                            uint16_t* msg_id)
+static esp_err_t _bluecherry_parse_ack_meta(const uint8_t* buf, size_t len,
+                                            uint8_t* type,
+                                            uint16_t* msg_id,
+                                            uint8_t* token_len,
+                                            const uint8_t** token)
 {
   if(len < 4) {
     return ESP_ERR_INVALID_SIZE;
   }
 
-  size_t offset = 0;
-  uint8_t header = buf[offset++];
+  uint8_t header = buf[0];
+
   uint8_t version = (header >> 6) & 0x03;
   if(version != 1) {
     return ESP_ERR_INVALID_VERSION;
   }
 
   *type = (header >> 4) & 0x03;
-  uint8_t token_len = header & 0x0F;
+  *token_len = header & 0x0F;
 
-  if(len < (size_t) (4 + token_len)) {
+  if(*token_len > 8) {
     return ESP_ERR_INVALID_SIZE;
   }
 
-  offset += token_len;
-  offset++; // code
+  if(len < (size_t)(4 + *token_len)) {
+    return ESP_ERR_INVALID_SIZE;
+  }
 
-  *msg_id = buf[offset++];
-  *msg_id <<= 8;
-  *msg_id |= buf[offset++];
+  *msg_id = ((uint16_t)buf[2] << 8) | buf[3];
+
+  *token = (*token_len > 0) ? &buf[4] : NULL;
+
+  if(*token_len > 0) {
+    char token_str[3 * 8 + 1] = {0}; // max TKL = 8
+    char* p = token_str;
+
+    for(uint8_t i = 0; i < *token_len; ++i) {
+      p += sprintf(p, "%02X ", (*token)[i]);
+    }
+
+    ESP_LOGI(TAG, "CoAP token (%uB): %s", *token_len, token_str);
+  } else {
+    ESP_LOGI(TAG, "CoAP token: none");
+  }
 
   return ESP_OK;
 }
@@ -896,9 +913,12 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
 
         uint8_t rsp_type = 0;
         uint16_t rsp_message_id = 0;
+        uint8_t rsp_token_len = 0;
+        const uint8_t* rsp_token = NULL;
         esp_err_t perr = _bluecherry_parse_ack_meta(_bluecherry_opdata.in_buf,
                                                      _bluecherry_opdata.in_buf_len, &rsp_type,
-                                                     &rsp_message_id);
+                                                     &rsp_message_id, 
+                                                     &rsp_token_len, &rsp_token);
         if(perr == ESP_ERR_INVALID_VERSION) {
           ESP_LOGW(TAG, "Ignoring CoAP packet with invalid version while awaiting ACK");
           continue;
@@ -1864,17 +1884,24 @@ esp_err_t bluecherry_sync(bool blocking)
     return ESP_ERR_INVALID_SIZE;
   }
 
-  uint16_t offset = 0;
+  uint8_t header = _bluecherry_opdata.in_buf[0];
 
-  uint8_t header = _bluecherry_opdata.in_buf[offset++];
   uint8_t version = (header >> 6) & 0x03;
+  uint8_t type = (header >> 4) & 0x03;
+  uint8_t token_len = header & 0x0F;
+
+  uint8_t code = _bluecherry_opdata.in_buf[1];
+
+  uint16_t msg_id =
+      ((uint16_t)_bluecherry_opdata.in_buf[2] << 8) |
+      _bluecherry_opdata.in_buf[3];
+
+  uint16_t offset = 4 + token_len;
+
   if(version != 1) {
     ESP_LOGE(TAG, "Received CoAP packet with version %d, expeced 1", version);
     return ESP_ERR_INVALID_VERSION;
   }
-
-  uint8_t type = (header >> 4) & 0x03;
-  uint8_t token_len = header & 0x0F;
 
   size_t min_header_len = (size_t) (token_len + BLUECHERRY_COAP_HEADER_SIZE);
   if(_bluecherry_opdata.in_buf_len < min_header_len) {
@@ -1883,11 +1910,6 @@ esp_err_t bluecherry_sync(bool blocking)
     return ESP_ERR_INVALID_SIZE;
   }
 
-  offset += token_len;
-  uint8_t code = _bluecherry_opdata.in_buf[offset++];
-  uint16_t msg_id = _bluecherry_opdata.in_buf[offset++];
-  msg_id <<= 8;
-  msg_id |= _bluecherry_opdata.in_buf[offset++];
   bool has_payload = (offset < _bluecherry_opdata.in_buf_len);
   if(has_payload) {
       if(_bluecherry_opdata.in_buf[offset++] != 0xFF) {
