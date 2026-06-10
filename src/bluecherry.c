@@ -1804,8 +1804,9 @@ esp_err_t bluecherry_sync(bool blocking)
         return ESP_ERR_NOT_FINISHED;
       }
 
-      _bluecherry_opdata.cur_message_id = 25;
-      _bluecherry_opdata.last_acked_message_id = 25;
+      uint16_t start_id = rand()%65535 + 1; 
+      _bluecherry_opdata.cur_message_id = start_id - 1;
+      _bluecherry_opdata.last_acked_message_id = start_id - 1;
 
       _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_IDLE;
       retryIntervalMs = 100;
