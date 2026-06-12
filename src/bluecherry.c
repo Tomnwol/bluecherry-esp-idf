@@ -869,93 +869,90 @@ static esp_err_t _bluecherry_parse_ack_meta(const uint8_t* buf, size_t len,
  */
 static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
 {
-  uint8_t no_payload_hdr[BLUECHERRY_COAP_HEADER_SIZE];
-  uint8_t* data = msg == NULL ? no_payload_hdr : msg->data;
-  size_t data_len = msg == NULL ? BLUECHERRY_COAP_HEADER_SIZE : msg->len;
+  uint8_t token_len = _bluecherry_opdata.last_token_len;
 
-  if(data_len < BLUECHERRY_COAP_HEADER_SIZE) {
-      ESP_LOGE(TAG, "Cannot send CoAP message smaller than %dB", BLUECHERRY_COAP_HEADER_SIZE);
-      return ESP_ERR_NO_MEM;
+  // Détermine la partie payload (0xFF + topic + len + data) si présente.
+  uint8_t* payload_part = NULL;
+  size_t payload_part_len = 0;
+  if(msg != NULL && msg->len > BLUECHERRY_COAP_HEADER_SIZE) {
+      payload_part = msg->data + BLUECHERRY_COAP_HEADER_SIZE;
+      payload_part_len = msg->len - BLUECHERRY_COAP_HEADER_SIZE;
   }
 
   uint16_t tx_message_id = _bluecherry_opdata.cur_message_id + 1;
   if(tx_message_id == 0) {
       tx_message_id = 1;
   }
+  uint8_t missed_msg_count = (uint8_t)(tx_message_id - _bluecherry_opdata.last_acked_message_id - 1);
 
-  uint8_t missed_msg_count = (uint8_t) (tx_message_id - _bluecherry_opdata.last_acked_message_id - 1);
-  data[0] = 0x40;
+  size_t header_len = 4 + token_len;
+  size_t data_len = header_len + payload_part_len;
+
+  uint8_t data[4 + 15 + BLUECHERRY_MAX_MESSAGE_LEN]; // buffer local, taille max raisonnable
+  // ou malloc si tu préfères éviter une grosse stack alloc
+
+  data[0] = 0x40 | token_len;
   data[1] = missed_msg_count;
   data[2] = tx_message_id >> 8;
   data[3] = tx_message_id & 0xFF;
-  if(msg != NULL && msg->len > BLUECHERRY_COAP_HEADER_SIZE) {
-  } else {
-      data_len = BLUECHERRY_COAP_HEADER_SIZE;
+  if(token_len > 0 && _bluecherry_opdata.last_token != NULL) {
+      memcpy(data + 4, _bluecherry_opdata.last_token, token_len);
+  }
+  if(payload_part_len > 0) {
+      memcpy(data + header_len, payload_part, payload_part_len);
   }
 
-  double timeout = BLUECHERRY_ACK_TIMEOUT *
-                   (1 + (rand() / (RAND_MAX + 1.0)) * (BLUECHERRY_ACK_RANDOM_FACTOR - 1));
-
-  for(uint8_t attempt = 1; attempt <= BLUECHERRY_MAX_RETRANSMITS; ++attempt) {
-    _bluecherry_opdata.last_tx_time = time(NULL);
-    _tickleWatchdog();
-
-    if(_bluecherry_mbed_dtls_write(data, data_len) < 0) {
-      return ESP_FAIL;
+    double timeout = BLUECHERRY_ACK_TIMEOUT *
+                     (1 + (rand() / (RAND_MAX + 1.0)) * (BLUECHERRY_ACK_RANDOM_FACTOR - 1));
+    for(uint8_t attempt = 1; attempt <= BLUECHERRY_MAX_RETRANSMITS; ++attempt) {
+        _bluecherry_opdata.last_tx_time = time(NULL);
+        _tickleWatchdog();
+        if(_bluecherry_mbed_dtls_write(data, data_len) < 0) {
+            return ESP_FAIL;
+        }
+        _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_AWAITING_RESPONSE;
+        while(true) {
+            int ret = _bluecherry_mbed_dtls_read(_bluecherry_opdata.in_buf, BLUECHERRY_MAX_MESSAGE_LEN);
+            if(ret > 0) {
+                _bluecherry_opdata.in_buf_len = ret;
+                uint8_t rsp_type = 0;
+                uint16_t rsp_message_id = 0;
+                esp_err_t perr = _bluecherry_parse_ack_meta(_bluecherry_opdata.in_buf,
+                                                             _bluecherry_opdata.in_buf_len, &rsp_type,
+                                                             &rsp_message_id,
+                                                             &_bluecherry_opdata.last_token_len,
+                                                             &_bluecherry_opdata.last_token);
+                if(perr == ESP_ERR_INVALID_VERSION) {
+                    ESP_LOGW(TAG, "Ignoring CoAP packet with invalid version while awaiting ACK");
+                    continue;
+                }
+                if(perr != ESP_OK) {
+                    ESP_LOGW(TAG, "Ignoring malformed CoAP packet while awaiting ACK");
+                    continue;
+                }
+                if(rsp_type != BLUECHERRY_COAP_TYPE_ACK) {
+                    ESP_LOGW(TAG, "Ignoring non-ACK CoAP packet while awaiting ACK");
+                    continue;
+                }
+                if(rsp_message_id != tx_message_id) {
+                    ESP_LOGW(TAG, "Received ACK with mismatching message ID %" PRIu16 " while awaiting %" PRIu16,
+                             rsp_message_id, tx_message_id);
+                    continue;
+                }
+                _bluecherry_opdata.cur_message_id = tx_message_id;
+                _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_RECEIVED_ACK;
+                return ESP_OK;
+            } else if(ret != MBEDTLS_ERR_SSL_TIMEOUT) {
+                return ESP_FAIL;
+            }
+            if(difftime(time(NULL), _bluecherry_opdata.last_tx_time) >= timeout) {
+                break;
+            }
+        }
+        timeout *= 2;
     }
-
-    _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_AWAITING_RESPONSE;
-
-    while(true) {
-      int ret = _bluecherry_mbed_dtls_read(_bluecherry_opdata.in_buf, BLUECHERRY_MAX_MESSAGE_LEN);
-      if(ret > 0) {
-        _bluecherry_opdata.in_buf_len = ret;
-
-        uint8_t rsp_type = 0;
-        uint16_t rsp_message_id = 0;
-        uint8_t rsp_token_len = 0;
-        const uint8_t* rsp_token = NULL;
-        esp_err_t perr = _bluecherry_parse_ack_meta(_bluecherry_opdata.in_buf,
-                                                     _bluecherry_opdata.in_buf_len, &rsp_type,
-                                                     &rsp_message_id, 
-                                                     &rsp_token_len, &rsp_token);
-        if(perr == ESP_ERR_INVALID_VERSION) {
-          ESP_LOGW(TAG, "Ignoring CoAP packet with invalid version while awaiting ACK");
-          continue;
-        }
-        if(perr != ESP_OK) {
-          ESP_LOGW(TAG, "Ignoring malformed CoAP packet while awaiting ACK");
-          continue;
-        }
-
-        if(rsp_type != BLUECHERRY_COAP_TYPE_ACK) {
-          ESP_LOGW(TAG, "Ignoring non-ACK CoAP packet while awaiting ACK");
-          continue;
-        }
-
-        if (rsp_message_id != tx_message_id) {
-          ESP_LOGW(TAG, "Received ACK with mismatching message ID %" PRIu16 " while awaiting %" PRIu16,
-                   rsp_message_id, tx_message_id);
-          continue;
-        }
-
-        _bluecherry_opdata.cur_message_id = tx_message_id;
-        _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_RECEIVED_ACK;
-        return ESP_OK;
-      } else if(ret != MBEDTLS_ERR_SSL_TIMEOUT) {
-        return ESP_FAIL;
-      }
-
-      if(difftime(time(NULL), _bluecherry_opdata.last_tx_time) >= timeout) {
-        break;
-      }
-    }
-
-    timeout *= 2;
-  }
-
-  _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_TIMED_OUT;
-  return ESP_ERR_TIMEOUT;
+    _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_TIMED_OUT;
+    return ESP_ERR_TIMEOUT;
 }
 
 /**
@@ -1827,6 +1824,8 @@ esp_err_t bluecherry_sync(bool blocking)
       uint16_t start_id = rand()%65535 + 1; 
       _bluecherry_opdata.cur_message_id = start_id - 1;
       _bluecherry_opdata.last_acked_message_id = start_id - 1;
+      _bluecherry_opdata.last_token_len = 0;
+      _bluecherry_opdata.last_token = NULL;
 
       _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_IDLE;
       retryIntervalMs = 100;

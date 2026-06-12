@@ -445,6 +445,8 @@ typedef struct {
    */
   uint16_t last_acked_message_id;
 
+  const uint8_t* last_token;
+  uint8_t last_token_len;
   /**
    * @brief The last CoAP transmission time.
    */
