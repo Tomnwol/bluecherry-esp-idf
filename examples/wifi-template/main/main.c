@@ -433,7 +433,7 @@ void app_main(void)
 
   while(true) {
     ESP_LOGI(TAG, "Publishing message");
-    bluecherry_publish(0x84, strlen("Test message") + 1, (const uint8_t*) "Test message");
+    bluecherry_publish(0x84, strlen("Test message111111111111111111111111111111111111111111111111") + 1, (const uint8_t*) "Test message111111111111111111111111111111111111111111111111");
     vTaskDelay(pdMS_TO_TICKS(5000));
     if(esp_task_wdt_status(NULL) == ESP_OK) {
       esp_task_wdt_reset();

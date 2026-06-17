@@ -21,7 +21,8 @@
  */
 
 #include <bluecherry.h>
-
+#include <coap/code.h>
+#include "lz4/lz4.h"
 /**
  * @brief The operational data used by the BlueCherry cloud  connection.
  */
@@ -807,10 +808,8 @@ cleanup:
  *
  * @return ESP_OK if parsing succeeded.
  */
-static esp_err_t _bluecherry_parse_ack_meta(const uint8_t* buf, size_t len,
-                                            uint8_t* type,
-                                            uint16_t* msg_id,
-                                            uint8_t* token_len,
+static esp_err_t _bluecherry_parse_ack_meta(const uint8_t* buf, size_t len, uint8_t* type,
+                                            uint16_t* msg_id, uint8_t* token_len,
                                             const uint8_t** token)
 {
   if(len < 4) {
@@ -831,16 +830,16 @@ static esp_err_t _bluecherry_parse_ack_meta(const uint8_t* buf, size_t len,
     return ESP_ERR_INVALID_SIZE;
   }
 
-  if(len < (size_t)(4 + *token_len)) {
+  if(len < (size_t) (4 + *token_len)) {
     return ESP_ERR_INVALID_SIZE;
   }
 
-  *msg_id = ((uint16_t)buf[2] << 8) | buf[3];
+  *msg_id = ((uint16_t) buf[2] << 8) | buf[3];
 
   *token = (*token_len > 0) ? &buf[4] : NULL;
 
   if(*token_len > 0) {
-    char token_str[3 * 8 + 1] = {0}; // max TKL = 8
+    char token_str[3 * 8 + 1] = { 0 }; // max TKL = 8
     char* p = token_str;
 
     for(uint8_t i = 0; i < *token_len; ++i) {
@@ -853,6 +852,27 @@ static esp_err_t _bluecherry_parse_ack_meta(const uint8_t* buf, size_t len,
   }
 
   return ESP_OK;
+}
+
+static void _bluecherry_log_hex(const char* label, const uint8_t* buf, size_t len)
+{
+  static char line[3 * 32 + 1];
+  size_t offset = 0;
+
+  while(offset < len) {
+    size_t chunk = len - offset;
+    if(chunk > 32) {
+      chunk = 32;
+    }
+
+    char* p = line;
+    for(size_t i = 0; i < chunk; i++) {
+      p += snprintf(p, sizeof(line) - (size_t) (p - line), "%02x ", buf[offset + i]);
+    }
+    *p = '\0';
+    ESP_LOGW(TAG, "%s [%u]: %s", label, (unsigned) offset, line);
+    offset += chunk;
+  }
 }
 
 /**
@@ -871,88 +891,133 @@ static esp_err_t _bluecherry_coap_rxtx(_bluecherry_msg_t* msg)
 {
   uint8_t token_len = _bluecherry_opdata.last_token_len;
 
-  // Détermine la partie payload (0xFF + topic + len + data) si présente.
   uint8_t* payload_part = NULL;
   size_t payload_part_len = 0;
   if(msg != NULL && msg->len > BLUECHERRY_COAP_HEADER_SIZE) {
-      payload_part = msg->data + BLUECHERRY_COAP_HEADER_SIZE;
-      payload_part_len = msg->len - BLUECHERRY_COAP_HEADER_SIZE;
+    payload_part = msg->data + BLUECHERRY_COAP_HEADER_SIZE;
+    payload_part_len = msg->len - BLUECHERRY_COAP_HEADER_SIZE;
   }
 
   uint16_t tx_message_id = _bluecherry_opdata.cur_message_id + 1;
   if(tx_message_id == 0) {
-      tx_message_id = 1;
+    tx_message_id = 1;
   }
-  uint8_t missed_msg_count = (uint8_t)(tx_message_id - _bluecherry_opdata.last_acked_message_id - 1);
 
   size_t header_len = 4 + token_len;
   size_t data_len = header_len + payload_part_len;
 
-  uint8_t data[4 + 15 + BLUECHERRY_MAX_MESSAGE_LEN]; // buffer local, taille max raisonnable
-  // ou malloc si tu préfères éviter une grosse stack alloc
+  static uint8_t data[4 + 15 + BLUECHERRY_MAX_MESSAGE_LEN];
 
   data[0] = 0x40 | token_len;
-  data[1] = missed_msg_count;
+
+  data[1] = ConstructCode(true, false);
+  // memcpy(data + header_len, payload_part, payload_part_len);
+  // data_len = header_len + payload_part_len;
+
+  uint8_t* bluecherry_part = payload_part + 1; // skip 0xFF
+  size_t bluecherry_len = payload_part_len - 1;
+
+  static uint8_t compressed_buf[MAX_PAYLOAD_SIZE];
+  ESP_LOGW("code.c", "compress payload");
+  ESP_LOGW(TAG, "src=%d compressBound=%d dst=%d", bluecherry_len, LZ4_compressBound(bluecherry_len),
+           MAX_PAYLOAD_SIZE);
+  int64_t start = esp_timer_get_time();
+
+  ESP_LOGW(TAG, "before compress");
+  ESP_LOGW(TAG, "stack free=%u", uxTaskGetStackHighWaterMark(NULL));
+  int compressed_len =
+      CompressPayload(bluecherry_part, (int) bluecherry_len, compressed_buf, MAX_PAYLOAD_SIZE);
+  memcpy(data + header_len + 1, compressed_buf, compressed_len);
+  ESP_LOGW(TAG, "stack free after=%u", uxTaskGetStackHighWaterMark(NULL));
+  if(compressed_len > 0) {
+    data[header_len] = 0xFF;
+    data_len = header_len + 1 + (size_t) compressed_len;
+  }
+
+  /*int compressed_len = -1;
+  if(payload_part_len > 0) {
+    uint8_t* bluecherry_part = payload_part + 1; // skip 0xFF
+    size_t bluecherry_len = payload_part_len - 1;
+
+    static uint8_t compressed_buf[MAX_PAYLOAD_SIZE];
+    ESP_LOGW("code.c", "compress payload");
+    compressed_len =
+        CompressPayload(bluecherry_part, (int) bluecherry_len, compressed_buf, MAX_PAYLOAD_SIZE);
+    ESP_LOGW("code.c", "after compress payload1");
+    if(compressed_len > 0) {
+      data[header_len] = 0xFF;
+      ESP_LOGW("code.c", "after compress payload2, compressed len=%d", compressed_len);
+      memcpy(data + header_len + 1, compressed_buf, compressed_len);
+      ESP_LOGW("code.c", "after compress payload3");
+      data_len = header_len + 1 + compressed_len;
+      data[1] = ConstructCode(true, false);
+    } else {
+      ESP_LOGW(TAG, "Compression failed, sending uncompressed");
+      memcpy(data + header_len, payload_part, payload_part_len);
+      data_len = header_len + payload_part_len;
+      data[1] = ConstructCode(false, false);
+    }
+  } else {
+    data[1] = ConstructCode(false, false);
+  }*/
   data[2] = tx_message_id >> 8;
   data[3] = tx_message_id & 0xFF;
   if(token_len > 0 && _bluecherry_opdata.last_token != NULL) {
-      memcpy(data + 4, _bluecherry_opdata.last_token, token_len);
+    ESP_LOGW(TAG, "token copy");
+    memcpy(data + 4, _bluecherry_opdata.last_token, token_len);
   }
-  if(payload_part_len > 0) {
-      memcpy(data + header_len, payload_part, payload_part_len);
-  }
+  _bluecherry_log_hex("tx data", data, data_len);
 
-    double timeout = BLUECHERRY_ACK_TIMEOUT *
-                     (1 + (rand() / (RAND_MAX + 1.0)) * (BLUECHERRY_ACK_RANDOM_FACTOR - 1));
-    for(uint8_t attempt = 1; attempt <= BLUECHERRY_MAX_RETRANSMITS; ++attempt) {
-        _bluecherry_opdata.last_tx_time = time(NULL);
-        _tickleWatchdog();
-        if(_bluecherry_mbed_dtls_write(data, data_len) < 0) {
-            return ESP_FAIL;
-        }
-        _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_AWAITING_RESPONSE;
-        while(true) {
-            int ret = _bluecherry_mbed_dtls_read(_bluecherry_opdata.in_buf, BLUECHERRY_MAX_MESSAGE_LEN);
-            if(ret > 0) {
-                _bluecherry_opdata.in_buf_len = ret;
-                uint8_t rsp_type = 0;
-                uint16_t rsp_message_id = 0;
-                esp_err_t perr = _bluecherry_parse_ack_meta(_bluecherry_opdata.in_buf,
-                                                             _bluecherry_opdata.in_buf_len, &rsp_type,
-                                                             &rsp_message_id,
-                                                             &_bluecherry_opdata.last_token_len,
-                                                             &_bluecherry_opdata.last_token);
-                if(perr == ESP_ERR_INVALID_VERSION) {
-                    ESP_LOGW(TAG, "Ignoring CoAP packet with invalid version while awaiting ACK");
-                    continue;
-                }
-                if(perr != ESP_OK) {
-                    ESP_LOGW(TAG, "Ignoring malformed CoAP packet while awaiting ACK");
-                    continue;
-                }
-                if(rsp_type != BLUECHERRY_COAP_TYPE_ACK) {
-                    ESP_LOGW(TAG, "Ignoring non-ACK CoAP packet while awaiting ACK");
-                    continue;
-                }
-                if(rsp_message_id != tx_message_id) {
-                    ESP_LOGW(TAG, "Received ACK with mismatching message ID %" PRIu16 " while awaiting %" PRIu16,
-                             rsp_message_id, tx_message_id);
-                    continue;
-                }
-                _bluecherry_opdata.cur_message_id = tx_message_id;
-                _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_RECEIVED_ACK;
-                return ESP_OK;
-            } else if(ret != MBEDTLS_ERR_SSL_TIMEOUT) {
-                return ESP_FAIL;
-            }
-            if(difftime(time(NULL), _bluecherry_opdata.last_tx_time) >= timeout) {
-                break;
-            }
-        }
-        timeout *= 2;
+  double timeout = BLUECHERRY_ACK_TIMEOUT *
+                   (1 + (rand() / (RAND_MAX + 1.0)) * (BLUECHERRY_ACK_RANDOM_FACTOR - 1));
+  for(uint8_t attempt = 1; attempt <= BLUECHERRY_MAX_RETRANSMITS; ++attempt) {
+    _bluecherry_opdata.last_tx_time = time(NULL);
+    _tickleWatchdog();
+    if(_bluecherry_mbed_dtls_write(data, data_len) < 0) {
+      return ESP_FAIL;
     }
-    _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_TIMED_OUT;
-    return ESP_ERR_TIMEOUT;
+    _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_AWAITING_RESPONSE;
+    while(true) {
+      int ret = _bluecherry_mbed_dtls_read(_bluecherry_opdata.in_buf, BLUECHERRY_MAX_MESSAGE_LEN);
+      if(ret > 0) {
+        _bluecherry_opdata.in_buf_len = ret;
+        uint8_t rsp_type = 0;
+        uint16_t rsp_message_id = 0;
+        esp_err_t perr = _bluecherry_parse_ack_meta(
+            _bluecherry_opdata.in_buf, _bluecherry_opdata.in_buf_len, &rsp_type, &rsp_message_id,
+            &_bluecherry_opdata.last_token_len, &_bluecherry_opdata.last_token);
+        if(perr == ESP_ERR_INVALID_VERSION) {
+          ESP_LOGW(TAG, "Ignoring CoAP packet with invalid version while awaiting ACK");
+          continue;
+        }
+        if(perr != ESP_OK) {
+          ESP_LOGW(TAG, "Ignoring malformed CoAP packet while awaiting ACK");
+          continue;
+        }
+        if(rsp_type != BLUECHERRY_COAP_TYPE_ACK) {
+          ESP_LOGW(TAG, "Ignoring non-ACK CoAP packet while awaiting ACK");
+          continue;
+        }
+        if(rsp_message_id != tx_message_id) {
+          ESP_LOGW(TAG,
+                   "Received ACK with mismatching message ID %" PRIu16 " while awaiting %" PRIu16,
+                   rsp_message_id, tx_message_id);
+          continue;
+        }
+        _bluecherry_opdata.cur_message_id = tx_message_id;
+        _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_RECEIVED_ACK;
+        return ESP_OK;
+      } else if(ret != MBEDTLS_ERR_SSL_TIMEOUT) {
+        return ESP_FAIL;
+      }
+      if(difftime(time(NULL), _bluecherry_opdata.last_tx_time) >= timeout) {
+        break;
+      }
+    }
+    timeout *= 2;
+  }
+  _bluecherry_opdata.state = BLUECHERRY_STATE_CONNECTED_TIMED_OUT;
+  return ESP_ERR_TIMEOUT;
 }
 
 /**
@@ -1708,7 +1773,9 @@ esp_err_t bluecherry_init(const char* device_cert, const char* device_key,
   }
 
   if(auto_sync) {
-    BaseType_t ret = xTaskCreate(_bluecherry_sync_task, "bc_sync", 4096, NULL, BLUECHERRY_SP, NULL);
+    BaseType_t ret =
+        xTaskCreate(_bluecherry_sync_task, "bc_sync", BLUECHERRY_SYNC_TASK_STACK, NULL,
+                    BLUECHERRY_SP, NULL);
     if(ret != pdPASS) {
       vQueueDelete(_bluecherry_opdata.out_queue);
       _bluecherry_opdata.out_queue = NULL;
@@ -1821,7 +1888,7 @@ esp_err_t bluecherry_sync(bool blocking)
         return ESP_ERR_NOT_FINISHED;
       }
 
-      uint16_t start_id = rand()%65535 + 1; 
+      uint16_t start_id = rand() % 65535 + 1;
       _bluecherry_opdata.cur_message_id = start_id - 1;
       _bluecherry_opdata.last_acked_message_id = start_id - 1;
       _bluecherry_opdata.last_token_len = 0;
@@ -1891,9 +1958,7 @@ esp_err_t bluecherry_sync(bool blocking)
 
   uint8_t code = _bluecherry_opdata.in_buf[1];
 
-  uint16_t msg_id =
-      ((uint16_t)_bluecherry_opdata.in_buf[2] << 8) |
-      _bluecherry_opdata.in_buf[3];
+  uint16_t msg_id = ((uint16_t) _bluecherry_opdata.in_buf[2] << 8) | _bluecherry_opdata.in_buf[3];
 
   uint16_t offset = 4 + token_len;
 
@@ -1911,10 +1976,10 @@ esp_err_t bluecherry_sync(bool blocking)
 
   bool has_payload = (offset < _bluecherry_opdata.in_buf_len);
   if(has_payload) {
-      if(_bluecherry_opdata.in_buf[offset++] != 0xFF) {
-          ESP_LOGE(TAG, "Received CoAP packet without payload marker");
-          return ESP_ERR_INVALID_RESPONSE;
-      }
+    if(_bluecherry_opdata.in_buf[offset++] != 0xFF) {
+      ESP_LOGE(TAG, "Received CoAP packet without payload marker");
+      return ESP_ERR_INVALID_RESPONSE;
+    }
   }
 
   if(type == BLUECHERRY_COAP_TYPE_ACK) {
@@ -1927,9 +1992,32 @@ esp_err_t bluecherry_sync(bool blocking)
     _bluecherry_opdata.last_acked_message_id = msg_id;
   }
 
+  want_resync = IsFlagInCode(code, HAS_MORE_MESSAGES);
+  if(IsFlagInCode(code, COMPRESSED_PAYLOAD)) {
+    ESP_LOGI(TAG, "COMPRESSED_PAYLOAD flag detected");
+  } else {
+    ESP_LOGI(TAG, "No COMPRESSED_PAYLOAD flag");
+  }
+
+  if(IsFlagInCode(code, COMPRESSED_PAYLOAD) && has_payload) {
+    static uint8_t decompressed[MAX_PAYLOAD_SIZE];
+    ESP_LOGW("code.c", "decompress payload");
+    int dec_len = DecompressPayload(_bluecherry_opdata.in_buf + offset,
+                                    (int) (_bluecherry_opdata.in_buf_len - offset), decompressed);
+    if(dec_len > 0) {
+      memcpy(_bluecherry_opdata.in_buf + offset, decompressed, dec_len);
+      _bluecherry_opdata.in_buf_len = (uint16_t) (offset + dec_len);
+    } else {
+      ESP_LOGE(TAG, "Decompression failed");
+      return ESP_ERR_INVALID_RESPONSE;
+    }
+  }
+  /*if() {
+    want_resync =
+  }
   switch(code) {
   case BLUECHERRY_COAP_RSP_VALID:
-    want_resync = false;
+     = false;
     break;
 
   case BLUECHERRY_COAP_RSP_CONTINUE:
@@ -1939,7 +2027,7 @@ esp_err_t bluecherry_sync(bool blocking)
   default:
     ESP_LOGE(TAG, "Received invalid CoAP code %02X", code);
     return ESP_ERR_INVALID_RESPONSE;
-  }
+  }*/
 
   while(offset < _bluecherry_opdata.in_buf_len) {
     uint8_t topic = _bluecherry_opdata.in_buf[offset++];
@@ -1980,16 +2068,17 @@ esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data)
 {
   ESP_LOGD(TAG, "Scheduling publish on topic 0x%02X with %dB of data", topic, len);
 
-  if(len > (BLUECHERRY_MAX_MESSAGE_LEN - (BLUECHERRY_COAP_HEADER_SIZE + 1 + BLUECHERRY_MQTT_HEADER_SIZE))) {
-      ESP_LOGE(TAG, "The message exceeds the maximum allowed size");
-      return ESP_ERR_INVALID_SIZE;
+  if(len > (BLUECHERRY_MAX_MESSAGE_LEN -
+            (BLUECHERRY_COAP_HEADER_SIZE + 1 + BLUECHERRY_MQTT_HEADER_SIZE))) {
+    ESP_LOGE(TAG, "The message exceeds the maximum allowed size");
+    return ESP_ERR_INVALID_SIZE;
   }
 
   size_t total_len = BLUECHERRY_COAP_HEADER_SIZE + 1 + BLUECHERRY_MQTT_HEADER_SIZE + len;
   uint8_t* data_cpy = malloc(total_len);
   if(data_cpy == NULL) {
-      ESP_LOGE(TAG, "Could not allocate publish buffer: %s", strerror(errno));
-      return ESP_ERR_NO_MEM;
+    ESP_LOGE(TAG, "Could not allocate publish buffer: %s", strerror(errno));
+    return ESP_ERR_NO_MEM;
   }
 
   data_cpy[BLUECHERRY_COAP_HEADER_SIZE] = 0xFF;
@@ -1999,8 +2088,8 @@ esp_err_t bluecherry_publish(uint8_t topic, uint16_t len, const uint8_t* data)
 
   _bluecherry_msg_t msg = { .len = total_len, .data = data_cpy };
   if(xQueueSendToBack(_bluecherry_opdata.out_queue, &msg, 0) != pdTRUE) {
-      free(data_cpy);
-      return ESP_ERR_NO_MEM;
+    free(data_cpy);
+    return ESP_ERR_NO_MEM;
   }
   return ESP_OK;
 }

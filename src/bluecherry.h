@@ -218,6 +218,11 @@ typedef enum {
 static const UBaseType_t BLUECHERRY_SP = 10;
 
 /**
+ * @brief Stack size for the BlueCherry sync task (DTLS + mbedtls need substantial stack).
+ */
+static const uint16_t BLUECHERRY_SYNC_TASK_STACK = 8192;
+
+/**
  * @brief The size of the BlueCherry CoAP header.
  */
 static const size_t BLUECHERRY_COAP_HEADER_SIZE = 4;
